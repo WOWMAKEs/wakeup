@@ -1,6 +1,4 @@
 use anyhow::Result;
-use objc::{msg_send, sel, sel_impl};
-use objc::runtime::{Class, Object};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::fs;
@@ -11,7 +9,8 @@ use std::str::FromStr;
 use std::thread;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{TrayIcon, TrayIconBuilder};
-use winit::event_loop::{ControlFlow, EventLoop};
+use winit::event_loop::ControlFlow;
+use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct Device {
@@ -73,30 +72,13 @@ fn compute_broadcast(ip: &str) -> String {
     }
 }
 
-fn send_wol(device: &Device) -> Result<()> {
+fn send_wol(device: &Device) {
     let mac_str = normalize_mac(&device.mac);
-    let mac = wol::MacAddr6::from_str(&mac_str)
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
-
-    let broadcast_str = compute_broadcast(&device.ip);
-    let broadcast: Ipv4Addr = broadcast_str
-        .parse()
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
-
-    wol::send_magic_packet(mac, None, SocketAddr::new(broadcast.into(), 9))
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
-
-    wol::send_magic_packet(mac, None, SocketAddr::new(Ipv4Addr::BROADCAST.into(), 9))
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
-
-    Ok(())
-}
-
-fn hide_dock_icon() {
-    unsafe {
-        let cls = Class::get("NSApplication").expect("NSApplication class not found");
-        let app: *mut Object = msg_send![cls, sharedApplication];
-        let _: () = msg_send![app, setActivationPolicy: 1];
+    if let Ok(mac) = wol::MacAddr6::from_str(&mac_str) {
+        let broadcast_str = compute_broadcast(&device.ip);
+        if let Ok(broadcast) = broadcast_str.parse::<Ipv4Addr>() {
+            let _ = wol::send_magic_packet(mac, None, SocketAddr::new(broadcast.into(), 9));
+        }
     }
 }
 
@@ -113,30 +95,76 @@ fn osascript(script: &str) -> Option<String> {
     }
 }
 
-fn show_add_dialog() -> Option<(String, String, String)> {
-    let script = r#"
-set dialogResult to display dialog "" default answer "" with title "wakeUP - Add Device" buttons {"Cancel", "OK"} default button 2
-
-set btn to button returned of dialogResult
-if btn is "Cancel" then return "CANCEL"
-
-set dName to text returned of dialogResult
-
-set ipResult to display dialog "" default answer "" with title "wakeUP - IP Address" buttons {"Cancel", "OK"} default button 2
-set btn to button returned of ipResult
-if btn is "Cancel" then return "CANCEL"
-
-set dIP to text returned of ipResult
-
-set macResult to display dialog "" default answer "" with title "wakeUP - MAC Address" buttons {"Cancel", "OK"} default button 2
-set btn to button returned of macResult
-if btn is "Cancel" then return "CANCEL"
-
-set dMAC to text returned of macResult
-
-return dName & "||" & dIP & "||" & dMAC
+const DIALOG_SWIFT: &str = r#"
+import Cocoa
+let app = NSApplication.shared
+app.setActivationPolicy(.accessory)
+app.activate(ignoringOtherApps: true)
+let alert = NSAlert()
+alert.messageText = "Add Device"
+alert.addButton(withTitle: "OK")
+alert.addButton(withTitle: "Cancel")
+let view = NSView(frame: NSRect(x: 0, y: 0, width: 340, height: 94))
+let nameLabel = NSTextField(labelWithString: "Device Name:")
+nameLabel.frame = NSRect(x: 0, y: 66, width: 105, height: 24)
+nameLabel.alignment = .right
+let nameField = NSTextField()
+nameField.frame = NSRect(x: 115, y: 66, width: 215, height: 24)
+nameField.placeholderString = "My PC"
+let ipLabel = NSTextField(labelWithString: "IP Address:")
+ipLabel.frame = NSRect(x: 0, y: 36, width: 105, height: 24)
+ipLabel.alignment = .right
+let ipField = NSTextField()
+ipField.frame = NSRect(x: 115, y: 36, width: 215, height: 24)
+ipField.placeholderString = "192.168.1.100"
+let macLabel = NSTextField(labelWithString: "MAC Address:")
+macLabel.frame = NSRect(x: 0, y: 6, width: 105, height: 24)
+macLabel.alignment = .right
+let macField = NSTextField()
+macField.frame = NSRect(x: 115, y: 6, width: 215, height: 24)
+macField.placeholderString = "AA:BB:CC:DD:EE:FF"
+view.addSubview(nameLabel)
+view.addSubview(nameField)
+view.addSubview(ipLabel)
+view.addSubview(ipField)
+view.addSubview(macLabel)
+view.addSubview(macField)
+alert.accessoryView = view
+let response = alert.runModal()
+if response == .alertFirstButtonReturn {
+    print("\(nameField.stringValue)||\(ipField.stringValue)||\(macField.stringValue)")
+} else {
+    print("CANCEL")
+}
 "#;
-    let result = osascript(script)?;
+
+fn ensure_dialog_binary() -> Option<PathBuf> {
+    let bin_path = dirs::home_dir()?.join(".wakeup_dialog");
+    if bin_path.exists() {
+        return Some(bin_path);
+    }
+    let src_path = dirs::home_dir()?.join(".wakeup_dialog.swift");
+    fs::write(&src_path, DIALOG_SWIFT).ok()?;
+    let result = std::process::Command::new("swiftc")
+        .args(["-o", bin_path.to_str()?, src_path.to_str()?])
+        .output()
+        .ok()?;
+    let _ = fs::remove_file(&src_path);
+    if result.status.success() {
+        Some(bin_path)
+    } else {
+        let _ = fs::remove_file(&bin_path);
+        None
+    }
+}
+
+fn show_add_dialog() -> Option<(String, String, String)> {
+    let bin_path = ensure_dialog_binary()?;
+    let output = std::process::Command::new(&bin_path).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let result = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if result == "CANCEL" {
         return None;
     }
@@ -148,6 +176,7 @@ return dName & "||" & dIP & "||" & dMAC
     let ip = parts[1].trim().to_string();
     let mac = parts[2].trim().to_string();
     if name.is_empty() || ip.is_empty() || mac.is_empty() {
+        show_error("All fields are required");
         return None;
     }
     Some((name, ip, mac))
@@ -290,18 +319,17 @@ fn handle_clear_devices(state: &mut AppState, tray: &TrayIcon) {
 }
 
 fn handle_wake(device: Device) {
-    let name = device.name.clone();
-    match send_wol(&device) {
-        Ok(()) => show_notification("wakeUP", &format!("WOL sent to {}", name)),
-        Err(e) => show_error(&format!("Failed: {}", e)),
-    }
+    send_wol(&device);
+    show_notification("wakeUP", &format!("WOL sent to {}", device.name));
 }
 
 fn main() -> Result<()> {
     let devices = load_devices();
-    let event_loop = EventLoop::new()?;
 
-    hide_dock_icon();
+    let mut builder = winit::event_loop::EventLoopBuilder::new();
+    builder.with_activation_policy(ActivationPolicy::Accessory);
+    builder.with_default_menu(false);
+    let event_loop = builder.build()?;
 
     let mut state = AppState::new(devices);
     let menu = state.build_menu();

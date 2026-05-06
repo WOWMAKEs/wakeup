@@ -82,5 +82,11 @@ echo ""
 echo "Building release..."
 cargo bundle --release
 
+APP_PATH="target/release/bundle/osx/wakeUP.app"
+PLIST="$APP_PATH/Contents/Info.plist"
+
+/usr/libexec/PlistBuddy -c "Add :LSUIElement bool true" "$PLIST" 2>/dev/null || \
+/usr/libexec/PlistBuddy -c "Set :LSUIElement true" "$PLIST"
+
 echo ""
-echo "Done! App at: target/release/bundle/osx/wakeUP.app"
+echo "Done! App at: $APP_PATH"
