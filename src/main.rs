@@ -1,0 +1,353 @@
+use anyhow::Result;
+use objc::{msg_send, sel, sel_impl};
+use objc::runtime::{Class, Object};
+use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
+use std::fs;
+use std::net::{Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
+use std::rc::Rc;
+use std::str::FromStr;
+use std::thread;
+use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::{TrayIcon, TrayIconBuilder};
+use winit::event_loop::{ControlFlow, EventLoop};
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct Device {
+    name: String,
+    ip: String,
+    mac: String,
+}
+
+fn config_path() -> PathBuf {
+    dirs::home_dir()
+        .expect("Cannot find home directory")
+        .join(".wol_devices.json")
+}
+
+fn load_devices() -> Vec<Device> {
+    let path = config_path();
+    if !path.exists() {
+        return Vec::new();
+    }
+    let content = fs::read_to_string(&path).unwrap_or_default();
+    serde_json::from_str(&content).unwrap_or_default()
+}
+
+fn save_devices(devices: &[Device]) -> Result<()> {
+    let path = config_path();
+    let content = serde_json::to_string_pretty(devices)?;
+    fs::write(path, content)?;
+    Ok(())
+}
+
+fn validate_mac(mac: &str) -> bool {
+    let mac = mac.trim();
+    let parts: Vec<&str> = mac.split(':').collect();
+    if parts.len() == 6 {
+        return parts.iter().all(|p| p.len() == 2 && u8::from_str_radix(p, 16).is_ok());
+    }
+    let parts: Vec<&str> = mac.split('-').collect();
+    if parts.len() == 6 {
+        return parts.iter().all(|p| p.len() == 2 && u8::from_str_radix(p, 16).is_ok());
+    }
+    false
+}
+
+fn normalize_mac(mac: &str) -> String {
+    let hex: String = mac.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    (0..6)
+        .map(|i| &hex[i * 2..i * 2 + 2])
+        .collect::<Vec<_>>()
+        .join(":")
+        .to_uppercase()
+}
+
+fn compute_broadcast(ip: &str) -> String {
+    let parts: Vec<&str> = ip.split('.').collect();
+    if parts.len() == 4 {
+        format!("{}.{}.{}.255", parts[0], parts[1], parts[2])
+    } else {
+        "255.255.255.255".to_string()
+    }
+}
+
+fn send_wol(device: &Device) -> Result<()> {
+    let mac_str = normalize_mac(&device.mac);
+    let mac = wol::MacAddr6::from_str(&mac_str)
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    let broadcast_str = compute_broadcast(&device.ip);
+    let broadcast: Ipv4Addr = broadcast_str
+        .parse()
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    wol::send_magic_packet(mac, None, SocketAddr::new(broadcast.into(), 9))
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    wol::send_magic_packet(mac, None, SocketAddr::new(Ipv4Addr::BROADCAST.into(), 9))
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    Ok(())
+}
+
+fn hide_dock_icon() {
+    unsafe {
+        let cls = Class::get("NSApplication").expect("NSApplication class not found");
+        let app: *mut Object = msg_send![cls, sharedApplication];
+        let _: () = msg_send![app, setActivationPolicy: 1];
+    }
+}
+
+fn osascript(script: &str) -> Option<String> {
+    let output = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .ok()?;
+    if output.status.success() {
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        None
+    }
+}
+
+fn show_add_dialog() -> Option<(String, String, String)> {
+    let script = r#"
+set dialogResult to display dialog "" default answer "" with title "wakeUP - Add Device" buttons {"Cancel", "OK"} default button 2
+
+set btn to button returned of dialogResult
+if btn is "Cancel" then return "CANCEL"
+
+set dName to text returned of dialogResult
+
+set ipResult to display dialog "" default answer "" with title "wakeUP - IP Address" buttons {"Cancel", "OK"} default button 2
+set btn to button returned of ipResult
+if btn is "Cancel" then return "CANCEL"
+
+set dIP to text returned of ipResult
+
+set macResult to display dialog "" default answer "" with title "wakeUP - MAC Address" buttons {"Cancel", "OK"} default button 2
+set btn to button returned of macResult
+if btn is "Cancel" then return "CANCEL"
+
+set dMAC to text returned of macResult
+
+return dName & "||" & dIP & "||" & dMAC
+"#;
+    let result = osascript(script)?;
+    if result == "CANCEL" {
+        return None;
+    }
+    let parts: Vec<&str> = result.split("||").collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let name = parts[0].trim().to_string();
+    let ip = parts[1].trim().to_string();
+    let mac = parts[2].trim().to_string();
+    if name.is_empty() || ip.is_empty() || mac.is_empty() {
+        return None;
+    }
+    Some((name, ip, mac))
+}
+
+fn show_error(message: &str) {
+    let script = format!(
+        "display dialog \"{}\" with title \"wakeUP\" buttons {{\"OK\"}} default button 1 with icon stop",
+        message.replace('\\', "\\\\").replace('"', "\\\"")
+    );
+    let _ = osascript(&script);
+}
+
+fn show_notification(title: &str, body: &str) {
+    let script = format!(
+        "display notification \"{}\" with title \"{}\"",
+        body.replace('\\', "\\\\").replace('"', "\\\""),
+        title.replace('\\', "\\\\").replace('"', "\\\"")
+    );
+    let _ = osascript(&script);
+}
+
+fn confirm_clear() -> bool {
+    let script = "display dialog \"Clear all devices?\" with title \"wakeUP\" buttons {\"Cancel\", \"Clear\"} default button 1 with icon caution";
+    osascript(script).map_or(false, |r| r.contains("Clear"))
+}
+
+fn create_power_icon() -> tray_icon::Icon {
+    let size = 22u32;
+    let mut rgba = Vec::with_capacity((size * size * 4) as usize);
+    let center = (size / 2) as f32;
+    let ring_radius = 8.0;
+    let ring_thickness = 2.8;
+    let gap_half_angle = 0.55;
+    let stem_half_width = 1.8;
+    let stem_top = center - ring_radius + ring_thickness * 0.5;
+    let stem_bottom = center - 1.5;
+
+    for y in 0..size {
+        for x in 0..size {
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+            let dx = px - center;
+            let dy = py - center;
+            let dist = (dx * dx + dy * dy).sqrt();
+            let angle = dy.atan2(dx);
+
+            let in_ring = dist >= ring_radius - ring_thickness / 2.0
+                && dist <= ring_radius + ring_thickness / 2.0
+                && !(angle > -gap_half_angle && angle < gap_half_angle);
+
+            let in_stem = px >= center - stem_half_width
+                && px <= center + stem_half_width
+                && py >= stem_top
+                && py <= stem_bottom;
+
+            if in_ring || in_stem {
+                rgba.extend_from_slice(&[0, 0, 0, 255]);
+            } else {
+                rgba.extend_from_slice(&[0, 0, 0, 0]);
+            }
+        }
+    }
+
+    tray_icon::Icon::from_rgba(rgba, size, size).unwrap()
+}
+
+struct AppState {
+    devices: Vec<Device>,
+    device_items: Vec<MenuItem>,
+    add_item: MenuItem,
+    clear_item: MenuItem,
+    quit_item: MenuItem,
+}
+
+impl AppState {
+    fn new(devices: Vec<Device>) -> Self {
+        Self {
+            devices,
+            device_items: Vec::new(),
+            add_item: MenuItem::new("Add New Device", true, None),
+            clear_item: MenuItem::new("Clear All Devices", true, None),
+            quit_item: MenuItem::new("Quit", true, None),
+        }
+    }
+
+    fn build_menu(&mut self) -> Menu {
+        let menu = Menu::new();
+        self.device_items.clear();
+
+        for device in &self.devices {
+            let item = MenuItem::new(&device.name, true, None);
+            self.device_items.push(item);
+            let _ = menu.append(self.device_items.last().unwrap());
+        }
+
+        let _ = menu.append(&PredefinedMenuItem::separator());
+        let _ = menu.append(&self.add_item);
+        let _ = menu.append(&self.clear_item);
+        let _ = menu.append(&PredefinedMenuItem::separator());
+        let _ = menu.append(&self.quit_item);
+
+        menu
+    }
+}
+
+fn handle_add_device(state: &mut AppState, tray: &TrayIcon) {
+    if let Some((name, ip, mac)) = show_add_dialog() {
+        if !validate_mac(&mac) {
+            show_error("Invalid MAC format. Expected: XX:XX:XX:XX:XX:XX");
+            return;
+        }
+
+        state.devices.push(Device { name, ip, mac });
+
+        if let Err(e) = save_devices(&state.devices) {
+            show_error(&format!("Failed to save: {}", e));
+            state.devices.pop();
+            return;
+        }
+
+        let menu = state.build_menu();
+        tray.set_menu(Some(Box::new(menu)));
+    }
+}
+
+fn handle_clear_devices(state: &mut AppState, tray: &TrayIcon) {
+    if state.devices.is_empty() {
+        return;
+    }
+
+    if confirm_clear() {
+        state.devices.clear();
+        if let Err(e) = save_devices(&state.devices) {
+            show_error(&format!("Failed to save: {}", e));
+        }
+        let menu = state.build_menu();
+        tray.set_menu(Some(Box::new(menu)));
+    }
+}
+
+fn handle_wake(device: Device) {
+    let name = device.name.clone();
+    match send_wol(&device) {
+        Ok(()) => show_notification("wakeUP", &format!("WOL sent to {}", name)),
+        Err(e) => show_error(&format!("Failed: {}", e)),
+    }
+}
+
+fn main() -> Result<()> {
+    let devices = load_devices();
+    let event_loop = EventLoop::new()?;
+
+    hide_dock_icon();
+
+    let mut state = AppState::new(devices);
+    let menu = state.build_menu();
+    let icon = create_power_icon();
+
+    let tray = TrayIconBuilder::new()
+        .with_menu(Box::new(menu))
+        .with_tooltip("wakeUP")
+        .with_icon(icon)
+        .with_icon_as_template(true)
+        .with_menu_on_left_click(true)
+        .build()?;
+
+    let state = Rc::new(RefCell::new(state));
+    let tray = Rc::new(RefCell::new(tray));
+
+    let state_rc = state.clone();
+    let tray_rc = tray.clone();
+
+    let menu_channel = MenuEvent::receiver();
+
+    event_loop.run(move |_event, window_target| {
+        window_target.set_control_flow(ControlFlow::Wait);
+
+        if let Ok(event) = menu_channel.try_recv() {
+            let event_id = event.id;
+            let mut state = state_rc.borrow_mut();
+            let tray = tray_rc.borrow();
+
+            if event_id == *state.quit_item.id() {
+                window_target.exit();
+            } else if event_id == *state.add_item.id() {
+                handle_add_device(&mut state, &tray);
+            } else if event_id == *state.clear_item.id() {
+                handle_clear_devices(&mut state, &tray);
+            } else {
+                for (i, item) in state.device_items.iter().enumerate() {
+                    if event_id == *item.id() {
+                        let device = state.devices[i].clone();
+                        thread::spawn(move || handle_wake(device));
+                        break;
+                    }
+                }
+            }
+        }
+    })?;
+
+    Ok(())
+}
