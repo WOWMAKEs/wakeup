@@ -216,46 +216,6 @@ fn confirm_clear() -> bool {
     osascript(script).map_or(false, |r| r.contains("Clear"))
 }
 
-fn create_power_icon() -> tray_icon::Icon {
-    let size = 22u32;
-    let mut rgba = Vec::with_capacity((size * size * 4) as usize);
-    let center = (size / 2) as f32;
-    let ring_radius = 8.0;
-    let ring_thickness = 2.8;
-    let gap_half_angle = 0.55;
-    let stem_half_width = 1.8;
-    let stem_top = center - ring_radius + ring_thickness * 0.5;
-    let stem_bottom = center - 1.5;
-
-    for y in 0..size {
-        for x in 0..size {
-            let px = x as f32 + 0.5;
-            let py = y as f32 + 0.5;
-            let dx = px - center;
-            let dy = py - center;
-            let dist = (dx * dx + dy * dy).sqrt();
-            let angle = dy.atan2(dx);
-
-            let in_ring = dist >= ring_radius - ring_thickness / 2.0
-                && dist <= ring_radius + ring_thickness / 2.0
-                && !(angle > -gap_half_angle && angle < gap_half_angle);
-
-            let in_stem = px >= center - stem_half_width
-                && px <= center + stem_half_width
-                && py >= stem_top
-                && py <= stem_bottom;
-
-            if in_ring || in_stem {
-                rgba.extend_from_slice(&[0, 0, 0, 255]);
-            } else {
-                rgba.extend_from_slice(&[0, 0, 0, 0]);
-            }
-        }
-    }
-
-    tray_icon::Icon::from_rgba(rgba, size, size).unwrap()
-}
-
 struct AppState {
     devices: Vec<Device>,
     device_items: Vec<MenuItem>,
@@ -341,13 +301,11 @@ fn main() -> Result<()> {
 
     let mut state = AppState::new(devices);
     let menu = state.build_menu();
-    let icon = create_power_icon();
 
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_tooltip("wakeUP")
-        .with_icon(icon)
-        .with_icon_as_template(true)
+        .with_title("⏻")
         .with_menu_on_left_click(true)
         .build()?;
 

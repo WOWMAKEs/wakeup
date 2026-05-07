@@ -4,19 +4,20 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
-echo "Generating app icon..."
+if [ ! -f "wakeUP.icns" ]; then
+    echo "Generating app icon..."
 
-python3 -c "
+    python3 -c "
 import struct, zlib, os, math
 
 def create_power_icon_png(size):
     center = size / 2.0
-    ring_radius = size * 0.36
-    ring_thickness = size * 0.13
-    gap_half_angle = 0.55
-    stem_half_width = size * 0.08
-    stem_top = center - ring_radius + ring_thickness * 0.5
-    stem_bottom = center - size * 0.07
+    ring_radius = size * 0.38
+    ring_thickness = size * 0.12
+    gap_half_angle = 0.5
+    stem_half_width = size * 0.06
+    stem_top = center - size * 0.45
+    stem_bottom = center - size * 0.05
 
     pixels = bytearray()
     for y in range(size):
@@ -28,9 +29,13 @@ def create_power_icon_png(size):
             dist = (dx*dx + dy*dy) ** 0.5
             angle = math.atan2(dy, dx)
 
+            # Check if point is in the ring, excluding the top gap
+            # Top is at -pi/2 (-1.5708)
+            is_top_gap = abs(angle - (-math.pi/2)) < gap_half_angle
+            
             in_ring = (dist >= ring_radius - ring_thickness/2.0 and
                        dist <= ring_radius + ring_thickness/2.0 and
-                       not (angle > -gap_half_angle and angle < gap_half_angle))
+                       not is_top_gap)
 
             in_stem = (px >= center - stem_half_width and
                        px <= center + stem_half_width and
@@ -74,10 +79,11 @@ for sz, name in entries:
 print('Iconset generated.')
 "
 
-iconutil -c icns wakeUP.iconset -o wakeUP.icns
-rm -rf wakeUP.iconset
+    iconutil -c icns wakeUP.iconset -o wakeUP.icns
+    rm -rf wakeUP.iconset
 
-echo "Icon generated: wakeUP.icns"
+    echo "Icon generated: wakeUP.icns"
+fi
 echo ""
 echo "Building release..."
 cargo bundle --release
