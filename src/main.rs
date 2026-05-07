@@ -7,7 +7,8 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::str::FromStr;
 use std::thread;
-use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use std::sync::mpsc;
+use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 use winit::event_loop::ControlFlow;
 use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
@@ -19,10 +20,18 @@ struct Device {
     mac: String,
 }
 
+fn app_dir() -> PathBuf {
+    let dir = dirs::data_dir()
+        .expect("Cannot find data directory")
+        .join("wakeUP");
+    if !dir.exists() {
+        let _ = fs::create_dir_all(&dir);
+    }
+    dir
+}
+
 fn config_path() -> PathBuf {
-    dirs::home_dir()
-        .expect("Cannot find home directory")
-        .join(".wol_devices.json")
+    app_dir().join("devices.json")
 }
 
 fn load_devices() -> Vec<Device> {
@@ -66,6 +75,8 @@ fn normalize_mac(mac: &str) -> String {
 fn compute_broadcast(ip: &str) -> String {
     let parts: Vec<&str> = ip.split('.').collect();
     if parts.len() == 4 {
+        // Default to local subnet broadcast for /24, 
+        // but fallback to global broadcast which is more reliable for WOL
         format!("{}.{}.{}.255", parts[0], parts[1], parts[2])
     } else {
         "255.255.255.255".to_string()
@@ -139,11 +150,12 @@ if response == .alertFirstButtonReturn {
 "#;
 
 fn ensure_dialog_binary() -> Option<PathBuf> {
-    let bin_path = dirs::home_dir()?.join(".wakeup_dialog");
+    let dir = app_dir();
+    let bin_path = dir.join("wakeup_dialog");
     if bin_path.exists() {
         return Some(bin_path);
     }
-    let src_path = dirs::home_dir()?.join(".wakeup_dialog.swift");
+    let src_path = dir.join("wakeup_dialog.swift");
     fs::write(&src_path, DIALOG_SWIFT).ok()?;
     let result = std::process::Command::new("swiftc")
         .args(["-o", bin_path.to_str()?, src_path.to_str()?])
@@ -247,6 +259,7 @@ fn create_power_icon() -> tray_icon::Icon {
 struct AppState {
     devices: Vec<Device>,
     device_items: Vec<MenuItem>,
+    remove_items: Vec<MenuItem>,
     add_item: MenuItem,
     clear_item: MenuItem,
     quit_item: MenuItem,
@@ -257,6 +270,7 @@ impl AppState {
         Self {
             devices,
             device_items: Vec::new(),
+            remove_items: Vec::new(),
             add_item: MenuItem::new("Add New Device", true, None),
             clear_item: MenuItem::new("Clear All Devices", true, None),
             quit_item: MenuItem::new("Quit", true, None),
@@ -266,40 +280,34 @@ impl AppState {
     fn build_menu(&mut self) -> Menu {
         let menu = Menu::new();
         self.device_items.clear();
+        self.remove_items.clear();
 
-        for device in &self.devices {
-            let item = MenuItem::new(&device.name, true, None);
-            self.device_items.push(item);
-            let _ = menu.append(self.device_items.last().unwrap());
+        if !self.devices.is_empty() {
+            for device in &self.devices {
+                let item = MenuItem::new(&device.name, true, None);
+                self.device_items.push(item);
+                let _ = menu.append(self.device_items.last().unwrap());
+            }
+            let _ = menu.append(&PredefinedMenuItem::separator());
         }
 
-        let _ = menu.append(&PredefinedMenuItem::separator());
         let _ = menu.append(&self.add_item);
-        let _ = menu.append(&self.clear_item);
+
+        if !self.devices.is_empty() {
+            let remove_menu = Submenu::new("Remove Device", true);
+            for device in &self.devices {
+                let item = MenuItem::new(format!("Remove {}", device.name), true, None);
+                self.remove_items.push(item);
+                let _ = remove_menu.append(self.remove_items.last().unwrap());
+            }
+            let _ = menu.append(&remove_menu);
+            let _ = menu.append(&self.clear_item);
+        }
+
         let _ = menu.append(&PredefinedMenuItem::separator());
         let _ = menu.append(&self.quit_item);
 
         menu
-    }
-}
-
-fn handle_add_device(state: &mut AppState, tray: &TrayIcon) {
-    if let Some((name, ip, mac)) = show_add_dialog() {
-        if !validate_mac(&mac) {
-            show_error("Invalid MAC format. Expected: XX:XX:XX:XX:XX:XX");
-            return;
-        }
-
-        state.devices.push(Device { name, ip, mac });
-
-        if let Err(e) = save_devices(&state.devices) {
-            show_error(&format!("Failed to save: {}", e));
-            state.devices.pop();
-            return;
-        }
-
-        let menu = state.build_menu();
-        tray.set_menu(Some(Box::new(menu)));
     }
 }
 
@@ -350,9 +358,28 @@ fn main() -> Result<()> {
     let tray_rc = tray.clone();
 
     let menu_channel = MenuEvent::receiver();
+    let (proxy_tx, proxy_rx) = mpsc::channel::<(String, String, String)>();
 
     event_loop.run(move |_event, window_target| {
         window_target.set_control_flow(ControlFlow::Wait);
+
+        if let Ok(new_device) = proxy_rx.try_recv() {
+            let mut state = state_rc.borrow_mut();
+            let tray = tray_rc.borrow();
+            let (name, ip, mac) = new_device;
+            if !validate_mac(&mac) {
+                show_error("Invalid MAC format. Expected: XX:XX:XX:XX:XX:XX");
+            } else {
+                state.devices.push(Device { name, ip, mac });
+                if let Err(e) = save_devices(&state.devices) {
+                    show_error(&format!("Failed to save: {}", e));
+                    state.devices.pop();
+                } else {
+                    let menu = state.build_menu();
+                    tray.set_menu(Some(Box::new(menu)));
+                }
+            }
+        }
 
         if let Ok(event) = menu_channel.try_recv() {
             let event_id = event.id;
@@ -362,15 +389,34 @@ fn main() -> Result<()> {
             if event_id == *state.quit_item.id() {
                 window_target.exit();
             } else if event_id == *state.add_item.id() {
-                handle_add_device(&mut state, &tray);
+                let tx = proxy_tx.clone();
+                thread::spawn(move || {
+                    if let Some(res) = show_add_dialog() {
+                        let _ = tx.send(res);
+                    }
+                });
             } else if event_id == *state.clear_item.id() {
                 handle_clear_devices(&mut state, &tray);
             } else {
+                let mut found = false;
                 for (i, item) in state.device_items.iter().enumerate() {
                     if event_id == *item.id() {
                         let device = state.devices[i].clone();
                         thread::spawn(move || handle_wake(device));
+                        found = true;
                         break;
+                    }
+                }
+
+                if !found {
+                    for (i, item) in state.remove_items.iter().enumerate() {
+                        if event_id == *item.id() {
+                            state.devices.remove(i);
+                            let _ = save_devices(&state.devices);
+                            let menu = state.build_menu();
+                            tray.set_menu(Some(Box::new(menu)));
+                            break;
+                        }
                     }
                 }
             }

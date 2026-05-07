@@ -9,7 +9,9 @@
 - 🔌 **纯菜单栏** — 仅在顶部菜单栏显示图标，Dock 完全不可见
 - 📡 **一键唤醒** — 点击设备名称即可发送 WOL 魔术包
 - 📝 **原生对话框** — 单窗口内三个标签+输入框，一次填写完成
-- 💾 **持久保存** — 设备列表保存在 `~/.wol_devices.json`，重启不丢失
+- 💾 **持久保存** — 设备列表保存在 `~/Library/Application Support/wakeUP/devices.json`，重启不丢失
+- 🗑️ **设备管理** — 通过 "Remove Device" 子菜单轻松删除单个设备
+- ⚡ **响应式 UI** — 异步对话框与后台执行，确保菜单栏操作丝滑顺畅
 - ✅ **MAC 校验** — 自动校验 MAC 地址格式，输入错误弹出提示
 - 🪶 **极致轻量** — 仅约 728KB，纯原生实现，无运行时依赖
 
@@ -21,6 +23,7 @@
 │ 💻 办公台式机            │
 │ ─────────────────────── │
 │ Add New Device           │
+│ Remove Device        >   │
 │ Clear All Devices        │
 │ ─────────────────────── │
 │ Quit                     │
@@ -83,7 +86,7 @@ chmod +x build.sh
 
 ## 配置文件
 
-设备信息保存在 `~/.wol_devices.json`：
+设备信息保存在 `~/Library/Application Support/wakeUP/devices.json`：
 
 ```json
 [

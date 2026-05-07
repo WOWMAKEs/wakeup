@@ -9,7 +9,9 @@ A lightweight macOS menu bar Wake-on-LAN tool written in Rust. No Dock icon, no 
 - 🔌 **Menu Bar Only** — Lives in the macOS menu bar, zero Dock presence
 - 📡 **One-Click Wake** — Click a device name to send a WOL magic packet
 - 📝 **Native Dialog** — Add device with a single window containing three labeled input fields
-- 💾 **Persistent Storage** — Devices saved to `~/.wol_devices.json`, survives restarts
+- 💾 **Persistent Storage** — Devices saved to `~/Library/Application Support/wakeUP/devices.json`, survives restarts
+- 🗑️ **Device Management** — Easily remove individual devices via the "Remove Device" submenu
+- ⚡ **Responsive UI** — Non-blocking dialogs and background execution for a smooth experience
 - ✅ **MAC Validation** — Automatic format checking with error prompts
 - 🪶 **Ultra-Lightweight** — ~728KB, pure native, no runtime dependencies
 
@@ -21,6 +23,7 @@ A lightweight macOS menu bar Wake-on-LAN tool written in Rust. No Dock icon, no 
 │ 💻 Office Desktop        │
 │ ─────────────────────── │
 │ Add New Device           │
+│ Remove Device        >   │
 │ Clear All Devices        │
 │ ─────────────────────── │
 │ Quit                     │
@@ -83,7 +86,7 @@ The app will be at `target/release/bundle/osx/wakeUP.app`.
 
 ## Configuration
 
-Devices are stored in `~/.wol_devices.json`:
+Devices are stored in `~/Library/Application Support/wakeUP/devices.json`:
 
 ```json
 [
